@@ -177,6 +177,9 @@ struct netdev_flow_key {
 #define SMC_BUCKET_CNT (SMC_ENTRIES / SMC_ENTRY_PER_BUCKET)
 #define SMC_MASK (SMC_BUCKET_CNT - 1)
 
+#define SMC_PROBE_CNT 3
+static uint32_t smc_probe_offsets[3] = {0, 1, SMC_BUCKET_CNT - 1};
+
 /* Default EMC insert probability is 1 / DEFAULT_EM_FLOW_INSERT_INV_PROB */
 #define DEFAULT_EM_FLOW_INSERT_INV_PROB 100
 #define DEFAULT_EM_FLOW_INSERT_MIN (UINT32_MAX /                     \
@@ -2831,18 +2834,17 @@ static inline const struct cmap_node *
 smc_entry_get(struct dp_netdev_pmd_thread *pmd, const uint32_t hash)
 {
     struct smc_cache *cache = &(pmd->flow_cache).smc_cache;
-    struct smc_bucket *bucket = &cache->buckets[hash & SMC_MASK];
     uint16_t sig = hash >> 16;
-    uint16_t index = UINT16_MAX;
 
-    for (int i = 0; i < SMC_ENTRY_PER_BUCKET; i++) {
-        if (bucket->sig[i] == sig) {
-            index = bucket->flow_idx[i];
-            break;
+    for (int probe = 0; probe < SMC_PROBE_CNT; ++probe) {
+        struct smc_bucket *bucket =
+            &cache->buckets[(hash + smc_probe_offsets[probe]) & SMC_MASK];
+        for (int i = 0; i < SMC_ENTRY_PER_BUCKET; i++) {
+            if (bucket->sig[i] == sig) {
+                return cmap_find_by_index(&pmd->flow_table,
+                                          bucket->flow_idx[i]);
+            }
         }
-    }
-    if (index != UINT16_MAX) {
-        return cmap_find_by_index(&pmd->flow_table, index);
     }
     return NULL;
 }
@@ -2865,7 +2867,8 @@ smc_insert(struct dp_netdev_pmd_thread *pmd,
            uint32_t hash)
 {
     struct smc_cache *smc_cache = &(pmd->flow_cache).smc_cache;
-    struct smc_bucket *bucket = &smc_cache->buckets[key->hash & SMC_MASK];
+    uint32_t bucket_index = key->hash & SMC_MASK;
+    struct smc_bucket *bucket;
     uint16_t index;
     uint32_t cmap_index;
     bool smc_enable_db;
@@ -2885,23 +2888,28 @@ smc_insert(struct dp_netdev_pmd_thread *pmd,
         return;
     }
 
-    /* If an entry with same signature already exists, update the index */
     uint16_t sig = key->hash >> 16;
-    for (i = 0; i < SMC_ENTRY_PER_BUCKET; i++) {
-        if (bucket->sig[i] == sig) {
-            bucket->flow_idx[i] = index;
-            return;
+    for (int probe = 0; probe < SMC_PROBE_CNT; ++probe) {
+        bucket = &smc_cache->buckets[(bucket_index + smc_probe_offsets[probe])
+                                     & SMC_MASK];
+        /* If an entry with same signature already exists, update the index */
+        for (i = 0; i < SMC_ENTRY_PER_BUCKET; i++) {
+            if (bucket->sig[i] == sig) {
+                bucket->flow_idx[i] = index;
+                return;
+            }
         }
-    }
-    /* If there is an empty entry, occupy it. */
-    for (i = 0; i < SMC_ENTRY_PER_BUCKET; i++) {
-        if (bucket->flow_idx[i] == UINT16_MAX) {
-            bucket->sig[i] = sig;
-            bucket->flow_idx[i] = index;
-            return;
+        /* If there is an empty entry, occupy it. */
+        for (i = 0; i < SMC_ENTRY_PER_BUCKET; i++) {
+            if (bucket->flow_idx[i] == UINT16_MAX) {
+                bucket->sig[i] = sig;
+                bucket->flow_idx[i] = index;
+                return;
+            }
         }
     }
     /* Otherwise, pick a random entry. */
+    bucket = &smc_cache->buckets[bucket_index];
     i = random_uint32() % SMC_ENTRY_PER_BUCKET;
     bucket->sig[i] = sig;
     bucket->flow_idx[i] = index;

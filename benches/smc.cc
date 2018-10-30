@@ -7,12 +7,12 @@
 
 #include "absl/container/flat_hash_map.h"
 
-static constexpr size_t kSMCEntriesPerBucket = 4;
+static constexpr size_t kSMCEntriesPerBucket = 8;
 static constexpr size_t kSMCEntries = 1 << 20;
 static constexpr size_t kSMCBucketCount = kSMCEntries / kSMCEntriesPerBucket;
 static constexpr size_t kSMCMask = kSMCBucketCount - 1;
-static constexpr size_t kNumKeys = 1000000;
-static constexpr size_t kNumQueries = 50000000;
+static constexpr size_t kSMCSignatureBits = 16;
+static constexpr size_t kSMCProbes = 4;
 
 struct SMCBucket {
   uint16_t sig[kSMCEntriesPerBucket];
@@ -31,36 +31,53 @@ void smc_init(SMC *smc) {
   }
 }
 
-void smc_insert(SMC *smc, uint32_t hash, uint16_t v) {
-  SMCBucket *bucket = &smc->buckets[hash & kSMCMask];
-  uint16_t sig = hash >> 16;
+size_t n_evict = 0;
 
-  for (size_t i = 0; i < kSMCEntriesPerBucket; ++i) {
-    if (bucket->sig[i] == sig) {
-      bucket->v[i] = v;
-      return;
+static inline uint64_t fibonacci_hash(uint64_t hash) {
+  return hash * 11400714819323198485llu;
+}
+
+void smc_insert(SMC *smc, uint32_t hash, uint16_t v) {
+  size_t bucket_idx = hash & kSMCMask;
+  uint16_t sig = hash >> (32 - kSMCSignatureBits);
+
+  for (size_t probe = 0; probe < kSMCProbes; ++probe) {
+    SMCBucket *bucket = &smc->buckets[bucket_idx];
+    for (size_t i = 0; i < kSMCEntriesPerBucket; ++i) {
+      if (bucket->sig[i] == sig) {
+        bucket->v[i] = v;
+        return;
+      }
     }
-  }
-  for (size_t i = 0; i < kSMCEntriesPerBucket; ++i) {
-    if (bucket->v[i] == UINT16_MAX) {
-      bucket->sig[i] = sig;
-      bucket->v[i] = v;
-      return;
+    for (size_t i = 0; i < kSMCEntriesPerBucket; ++i) {
+      if (bucket->v[i] == UINT16_MAX) {
+        bucket->sig[i] = sig;
+        bucket->v[i] = v;
+        return;
+      }
     }
+    bucket_idx = (bucket_idx + probe + 1) & kSMCMask;
   }
+
+  SMCBucket *bucket = &smc->buckets[hash & kSMCMask];
   size_t evict = rand() % kSMCEntriesPerBucket;
   bucket->sig[evict] = sig;
   bucket->v[evict] = v;
+  ++n_evict;
 }
 
 uint16_t smc_lookup(SMC *smc, uint32_t hash) {
-  SMCBucket *bucket = &smc->buckets[hash & kSMCMask];
-  uint16_t sig = hash >> 16;
+  size_t bucket_idx = hash & kSMCMask;
+  uint16_t sig = hash >> (32 - kSMCSignatureBits);
 
-  for (size_t i = 0; i < kSMCEntriesPerBucket; ++i) {
-    if (bucket->sig[i] == sig) {
-      return bucket->v[i];
+  for (size_t probe = 0; probe < kSMCProbes; ++probe) {
+    SMCBucket *bucket = &smc->buckets[bucket_idx];
+    for (size_t i = 0; i < kSMCEntriesPerBucket; ++i) {
+      if (bucket->sig[i] == sig) {
+        return bucket->v[i];
+      }
     }
+    bucket_idx = (bucket_idx + probe + 1) & kSMCMask;
   }
   return UINT16_MAX;
 }
@@ -93,6 +110,9 @@ static uint64_t get_clock_frequency() {
   return 0;
 }
 
+static constexpr size_t kNumKeys = 1000000;
+static constexpr size_t kNumQueries = 50000000;
+
 SMC smc __attribute__((aligned(64)));
 uint32_t keys[kNumKeys];
 uint16_t values[kNumKeys];
@@ -108,42 +128,48 @@ int main() {
   {
     smc_init(&smc);
     uint64_t start = rdtsc();
-    size_t n_miss = 0;
+    size_t n_miss = 0, n_collision = 0;
     for (size_t i = 0; i < kNumQueries; ++i) {
       size_t idx = rand() % kNumKeys;
       uint16_t v = smc_lookup(&smc, keys[idx]);
-      if (v != values[idx]) {
+      if (v == UINT16_MAX) {
         smc_insert(&smc, keys[idx], values[idx]);
         ++n_miss;
+      } else if (v != values[idx]) {
+        smc_insert(&smc, keys[idx], values[idx]);
+        ++n_collision;
       }
     }
     uint64_t end = rdtsc();
 
-    printf("<SMC> hit rate: %.2lf, throughput: %.2lf Mpps\n",
-           (double)(kNumQueries - n_miss) / kNumQueries,
+    printf("[SMC] hit rate: %.2lf, miss: %lu, collision: %lu, evict: %lu, "
+           "throughput: %.2lf "
+           "Mpps\n",
+           (double)(kNumQueries - n_miss - n_collision) / kNumQueries, n_miss,
+           n_collision, n_evict,
            kNumQueries / ((double)(end - start) / get_clock_frequency()) /
                1000000);
   }
 
-  {
-    absl::flat_hash_map<uint32_t, uint16_t> m;
-    uint64_t start = rdtsc();
-    size_t n_miss = 0;
-    for (size_t i = 0; i < kNumQueries; ++i) {
-      size_t idx = rand() % kNumKeys;
-      auto it = m.find(keys[idx]);
-      if (it == m.end()) {
-        m.emplace(keys[idx], values[idx]);
-        ++n_miss;
-      }
-    }
-    uint64_t end = rdtsc();
+  // {
+  //   absl::flat_hash_map<uint32_t, uint16_t> m;
+  //   uint64_t start = rdtsc();
+  //   size_t n_miss = 0;
+  //   for (size_t i = 0; i < kNumQueries; ++i) {
+  //     size_t idx = rand() % kNumKeys;
+  //     auto it = m.find(keys[idx]);
+  //     if (it == m.end()) {
+  //       m.emplace(keys[idx], values[idx]);
+  //       ++n_miss;
+  //     }
+  //   }
+  //   uint64_t end = rdtsc();
 
-    printf("<SwissTable> hit rate: %.2lf, throughput: %.2lf Mpps\n",
-           (double)(kNumQueries - n_miss) / kNumQueries,
-           kNumQueries / ((double)(end - start) / get_clock_frequency()) /
-               1000000);
-  }
+  //   printf("<SwissTable> hit rate: %.2lf, throughput: %.2lf Mpps\n",
+  //          (double)(kNumQueries - n_miss) / kNumQueries,
+  //          kNumQueries / ((double)(end - start) / get_clock_frequency()) /
+  //              1000000);
+  // }
 
   return 0;
 }

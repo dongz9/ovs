@@ -269,6 +269,8 @@ uint16_t smc_lookup(SMC *smc, uint32_t hash) {
   return 0xFFFF;
 }
 
+uint_fast64_t counter[4];
+
 uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
   uint16_t sig = hash >> (32 - kSMCSignatureBits);
 
@@ -286,6 +288,7 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
 
     if (idx >> 2) {
       uint16_t v = smc->buckets[alt_bucket_idx].v[idx & 3];
+      // ++counter[idx&3];
       if (((idx & 3) > 0) && lru) {
         swap(smc->buckets[alt_bucket_idx].sig[(idx & 3) - 1],
              smc->buckets[alt_bucket_idx].sig[idx & 3]);
@@ -295,6 +298,7 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
       return v;
     } else {
       uint16_t v = smc->buckets[bucket_idx].v[idx & 3];
+      // ++counter[idx&3];
       if (((idx & 3) > 0) && lru) {
         swap(smc->buckets[bucket_idx].sig[(idx & 3) - 1],
              smc->buckets[bucket_idx].sig[idx & 3]);
@@ -314,8 +318,24 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
     }
     int idx = __builtin_ctz(bitmask) / 2;
     if (idx < 4) {
+      if (idx > 0 && lru) {
+        swap(smc->buckets[bucket_idx].sig[idx-1],
+             smc->buckets[bucket_idx].sig[idx]);
+        swap(smc->buckets[bucket_idx].v[idx-1],
+             smc->buckets[bucket_idx].v[idx]);
+        return smc->buckets[bucket_idx].v[idx-1];      
+      }
+      // counter[idx]++;
       return smc->buckets[bucket_idx].v[idx];
     } else {
+      if (idx > 8 && lru) {
+        swap(smc->buckets[bucket_idx+1].sig[idx-9],
+             smc->buckets[bucket_idx+1].sig[idx-8]);
+        swap(smc->buckets[bucket_idx+1].v[idx-9],
+             smc->buckets[bucket_idx+1].v[idx-8]);
+        return smc->buckets[bucket_idx+1].v[idx-9];
+      }
+      // ++counter[idx-8];
       return smc->buckets[bucket_idx+1].v[idx-8];
     }
   }
@@ -475,13 +495,13 @@ int main(int argc, char *argv[]) {
     }
     uint16_t v;
     if (avx) {
-      // uint64_t lookup_start = rdtsc();
+      uint64_t lookup_start = rdtsc();
       v = smc_lookup_wide(&smc, keys[idx]);
-      // lookup_cycles += rdtsc() - lookup_start;
+      lookup_cycles += rdtsc() - lookup_start;
     } else {
-      // uint64_t lookup_start = rdtsc();
+      uint64_t lookup_start = rdtsc();
       v = smc_lookup(&smc, keys[idx]);
-      // lookup_cycles += rdtsc() - lookup_start;
+      lookup_cycles += rdtsc() - lookup_start;
     }
     if (v == 0xFFFF || v != values[idx]) {
       // uint64_t miss_start = rdtsc();

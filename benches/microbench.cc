@@ -269,9 +269,9 @@ uint16_t smc_lookup(SMC *smc, uint32_t hash) {
   return 0xFFFF;
 }
 
-uint_fast64_t counter[4];
+uint64_t counter0,counter1,counter2,counter3;
 
-uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
+uint16_t smc_lookup_wide(SMC *smc, uint32_t hash, uint32_t (&counter)[2]) {
   uint16_t sig = hash >> (32 - kSMCSignatureBits);
 
   uint32_t bucket_idx = hash & kSMCMask;
@@ -288,7 +288,7 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
 
     if (idx >> 2) {
       uint16_t v = smc->buckets[alt_bucket_idx].v[idx & 3];
-      // ++counter[idx&3];
+      ++counter[idx&1];
       if (((idx & 3) > 0) && lru) {
         swap(smc->buckets[alt_bucket_idx].sig[(idx & 3) - 1],
              smc->buckets[alt_bucket_idx].sig[idx & 3]);
@@ -298,7 +298,7 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
       return v;
     } else {
       uint16_t v = smc->buckets[bucket_idx].v[idx & 3];
-      // ++counter[idx&3];
+      ++counter[idx&1];
       if (((idx & 3) > 0) && lru) {
         swap(smc->buckets[bucket_idx].sig[(idx & 3) - 1],
              smc->buckets[bucket_idx].sig[idx & 3]);
@@ -318,6 +318,10 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
     }
     int idx = __builtin_ctz(bitmask) / 2;
     if (idx < 4) {
+      if (idx==0) ++counter0;
+      else if (idx==1) ++counter1;
+      else if (idx==2) ++counter2;
+      else ++counter3;
       if (idx > 0 && lru) {
         swap(smc->buckets[bucket_idx].sig[idx-1],
              smc->buckets[bucket_idx].sig[idx]);
@@ -325,9 +329,12 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
              smc->buckets[bucket_idx].v[idx]);
         return smc->buckets[bucket_idx].v[idx-1];      
       }
-      // counter[idx]++;
       return smc->buckets[bucket_idx].v[idx];
     } else {
+      if (idx==8) ++counter0;
+      else if (idx==9) ++counter1;
+      else if (idx==10) ++counter2;
+      else ++counter3;
       if (idx > 8 && lru) {
         swap(smc->buckets[bucket_idx+1].sig[idx-9],
              smc->buckets[bucket_idx+1].sig[idx-8]);
@@ -335,7 +342,6 @@ uint16_t smc_lookup_wide(SMC *smc, uint32_t hash) {
              smc->buckets[bucket_idx+1].v[idx-8]);
         return smc->buckets[bucket_idx+1].v[idx-9];
       }
-      // ++counter[idx-8];
       return smc->buckets[bucket_idx+1].v[idx-8];
     }
   }
@@ -457,6 +463,8 @@ int main(int argc, char *argv[]) {
 
   // size_t count = 0, count2 = 0;
 
+  static uint32_t counter[2] = {0, 0};
+
   smc_init(&smc);
   for (uint32_t i = 0; i < kNumWarmups; ++i) {
     uint32_t idx;
@@ -470,7 +478,7 @@ int main(int argc, char *argv[]) {
     }
     uint16_t v;
     if (avx) {
-      v = smc_lookup_wide(&smc, keys[idx]);
+      v = smc_lookup_wide(&smc, keys[idx], counter);
     } else {
       v = smc_lookup(&smc, keys[idx]);
     }
@@ -495,13 +503,13 @@ int main(int argc, char *argv[]) {
     }
     uint16_t v;
     if (avx) {
-      uint64_t lookup_start = rdtsc();
-      v = smc_lookup_wide(&smc, keys[idx]);
-      lookup_cycles += rdtsc() - lookup_start;
+      // uint64_t lookup_start = rdtsc();
+      v = smc_lookup_wide(&smc, keys[idx], counter);
+      // lookup_cycles += rdtsc() - lookup_start;
     } else {
-      uint64_t lookup_start = rdtsc();
+      // uint64_t lookup_start = rdtsc();
       v = smc_lookup(&smc, keys[idx]);
-      lookup_cycles += rdtsc() - lookup_start;
+      // lookup_cycles += rdtsc() - lookup_start;
     }
     if (v == 0xFFFF || v != values[idx]) {
       // uint64_t miss_start = rdtsc();
